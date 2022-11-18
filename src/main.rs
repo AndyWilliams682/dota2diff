@@ -118,6 +118,12 @@ fn save_diff_as_html(diff_result: Vec<PatchChange>) {
 
     for change in diff_result {
         let change_text = change.write_text();
+
+        // Handling RelativeChangee values of 0 (no net change between patches)
+        if change_text.contains("unchanged") {
+            continue
+        }
+
         let headers: Vec<&str> = change_text.split(" > ").collect();
 
         if headers[0] != current_h2 {

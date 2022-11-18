@@ -3,6 +3,7 @@ use regex::Regex;
 pub const ABS_NUM_STR: &str = r"(.*) (?:increased|decreased) from (\S*) to (\S*)";
 pub const REL_NUM_STR: &str = r"(.*) (increased|decreased) by (\S*$)";
 pub const ABS_TXT_STR: &str = r"(.*Talent) (.*) replaced with (.*)";
+pub const NEW_NUM_STR: &str = r".*ow has a (\S*) ([^,]*)";
 
 #[derive(Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub enum ChangeData {
@@ -59,6 +60,7 @@ impl PatchChange {
         let abs_num_change = Regex::new(ABS_NUM_STR).unwrap();
         let rel_num_change = Regex::new(REL_NUM_STR).unwrap();
         let abs_txt_change = Regex::new(ABS_TXT_STR).unwrap();
+        let new_num_change = Regex::new(NEW_NUM_STR).unwrap();
 
         if abs_num_change.is_match(&change_line) {
             let capture_groups = abs_num_change.captures(&change_line).unwrap();
@@ -97,6 +99,16 @@ impl PatchChange {
             );
             return PatchChange::new(&property, &version.to_string(), data);
 
+        } else if new_num_change.is_match(&change_line) {
+            let capture_groups = new_num_change.captures(&change_line).unwrap();
+            let mut property = tree_location;
+            property.push_str(" > ");
+            property.push_str(capture_groups.get(2).unwrap().as_str());
+            let data = ChangeData::AbsoluteChange(
+                "0".to_string(),
+                capture_groups.get(1).unwrap().as_str().to_string()
+            );
+            return PatchChange::new(&property, &version.to_string(), data)
         } else {
             let data = ChangeData::OtherChange(change_line.to_string());
             return PatchChange::new(&tree_location, &version.to_string(), data);
@@ -105,17 +117,23 @@ impl PatchChange {
 
     pub fn write_text(&self) -> String {
         let property = &self.property;
-        // let version = &self.version;
         let data = &self.data;
 
         match data {
             ChangeData::AbsoluteChange(old, new) => {
-                return format!("{} changed from {} to {}", property, old, new)
+                if property.contains("Talent") {
+                    return format!("{} {} replaced with {}", property, old, new)
+                } else {
+                    let direction = absolute_change_direction(old, new);
+                    return format!("{} {} from {} to {}", property, direction, old, new)
+                }
             },
             ChangeData::RelativeChange(value) => {
                 let mut direction = "increased".to_string();
                 if value < &0 {
                     direction = "decreased".to_string()
+                } else if value == &0 {
+                    return format!("{} unchanged", property)
                 }
                 return format!("{} {} by {}", property, direction, value)
             },
@@ -157,9 +175,57 @@ pub fn patch_diff(mut combined_patches: Vec<PatchChange>) -> Vec<PatchChange> {
     return result;
 }
 
+fn absolute_change_direction(old: &String, new: &String) -> String {
+    let num_match = Regex::new(r"([0-9\.]+)").unwrap();
+    let old_values: Vec<&str> = old.split("/").collect();
+    let new_values: Vec<&str> = new.split("/").collect();
+    let mut longest_len = old_values.len();
+
+    if new_values.len() > longest_len {
+        longest_len = new_values.len()
+    }
+
+    let mut i = 0;
+
+    let mut is_inc = false;
+    let mut is_dec = false;
+
+    while i < longest_len {
+        let mut old_str = old_values[old_values.len() - 1];
+        if i < old_values.len() {
+            old_str = old_values[i];
+        }
+        let old_value = num_match.captures(&old_str).unwrap().get(0).unwrap().as_str().parse::<f32>().unwrap();
+        let mut new_str = new_values[new_values.len() - 1];
+        if i < new_values.len() {
+            new_str = new_values[i];
+        }
+        let new_value = num_match.captures(&new_str).unwrap().get(0).unwrap().as_str().parse::<f32>().unwrap();
+        if new_value < old_value && is_dec == false {
+            is_dec = true
+        }
+        if new_value > old_value && is_inc == false {
+            is_inc = true
+        }
+        i += 1;
+    }
+
+    if is_inc && is_dec {
+            return "rescaled".to_string()
+        }
+    if is_inc {
+        return "increased".to_string()
+    }
+    if is_dec {
+        return "decreased".to_string()
+    }
+    
+    return "changed".to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::model::{ChangeData, PatchChange, patch_diff};
+    use crate::model::{ChangeData, PatchChange, patch_diff, absolute_change_direction};
 
     #[test]
     fn absolute_diff_works() {
@@ -315,6 +381,19 @@ mod tests {
     }
 
     #[test]
+    fn new_num_parse_works() {
+        let change_line = "Avatar now has a 50 Mana Cost";
+        let tree_location = "Items > Black King Bar".to_string();
+        let version = "7.32";
+        let result = PatchChange::parse_text(change_line, tree_location, version);
+        assert_eq!(PatchChange::new(
+            &"Items > Black King Bar > Mana Cost".to_string(),
+            &"7.32".to_string(),
+            ChangeData::AbsoluteChange("0".to_string(), "50".to_string())
+        ), result)
+    }
+
+    #[test]
     fn other_parse_works() {
         let change_line = "Random Change";
         let tree_location = "Heroes > Crystal Maiden".to_string();
@@ -335,7 +414,7 @@ mod tests {
             ChangeData::AbsoluteChange("4.5s".to_string(), "5.5s".to_string())
         );
         let result = change.write_text();
-        assert_eq!("Items > Blade Mail > Duration changed from 4.5s to 5.5s".to_string(), result)
+        assert_eq!("Items > Blade Mail > Duration increased from 4.5s to 5.5s".to_string(), result)
     }
 
     #[test]
@@ -358,5 +437,26 @@ mod tests {
         );
         let result = change.write_text();
         assert_eq!("Heroes > Zeus > Random Change".to_string(), result)
+    }
+
+    #[test]
+    fn abs_change_inc_works() {
+        let old = "1s".to_string();
+        let new = "2s".to_string();
+        assert_eq!("increased".to_string(), absolute_change_direction(&old, &new));
+    }
+
+    #[test]
+    fn abs_change_dec_works() {
+        let old = "2s".to_string();
+        let new = "1s".to_string();
+        assert_eq!("decreased".to_string(), absolute_change_direction(&old, &new));
+    }
+
+    #[test]
+    fn abs_change_res_works() {
+        let old = "1/3/4/6s".to_string();
+        let new = "2/3/4/5s".to_string();
+        assert_eq!("rescaled".to_string(), absolute_change_direction(&old, &new));
     }
 }
